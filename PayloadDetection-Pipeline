@@ -1,1 +1,496 @@
+#!/usr/bin/env python3
+import numpy as np
+import pandas as pd
+import tensorflow as tf
+from tensorflow.keras.layers import Input, Embedding, LSTM, Bidirectional, Dense, Concatenate, Dropout, BatchNormalization
+from tensorflow.keras.models import Model
+from tensorflow.keras.preprocessing.text import Tokenizer
+from tensorflow.keras.preprocessing.sequence import pad_sequences
+from sklearn.model_selection import train_test_split
+import pickle
+import re
+import math
+import os
+import shap
+import urllib.parse
+import html
+import base64
+import socket
+import ipaddress
+from datetime import datetime
 
+# Ensure clean mathematical reproduction
+np.random.seed(42)
+tf.random.set_seed(42)
+
+# =====================================================================
+# SYSTEM FILE CONFIGURATION CONSTANTS
+# =====================================================================
+RAW_DATASET_PATH = 'unified_web_vulnerabilities_dataset_fixed.csv'
+MODEL_PATH = 'structural_hybrid_waf_model.keras'
+FINE_TUNED_MODEL_PATH = 'structural_hybrid_waf_model_finetuned.keras'
+TOKENIZER_PATH = 'tokenizer_structural_v3.pkl'
+CORRECTED_DATA_PATH = 'manually_corrected_edge_cases.csv'
+AUDIT_LOG_PATH = 'waf_triage_audit.log'
+
+MAX_CHARS = 250
+TARGET_NAMES = ['Benign', 'XSS', 'SQLi', 'SSRF']
+
+# =====================================================================
+# UPGRADED POST-INFERENCE CIRCUIT BREAKER REGEX MATRIX (ANTI-EVASION)
+# =====================================================================
+REAL_SQLI_SYNTAX = re.compile(
+    r"['\"`\-\-\#]|\/\*|\*\/|\b(or|and)\b\s+\d+\s*\=\s*\d+|"
+    r"/\*!\d+|\b0x[0-9a-fA-F]+\b|\/\*\*\/|\bsys\.tables\b|\bfrom\b", 
+    re.IGNORECASE
+)
+
+# Broadened string indicator fallback definitions
+REAL_SSRF_SYNTAX = re.compile(
+    r"https?://|\b(localhost|aws|metadata|compute|latest/meta-data|internal)\b|@[0-9a-zA-Z.]+", 
+    re.IGNORECASE
+)
+
+REAL_XSS_SYNTAX = re.compile(
+    r"[<>]|javascript:|onload|onerror|onclick|eval\(|\bfromcharcode\b", 
+    re.IGNORECASE
+)
+
+FEATURE_NAMES = [
+    "String_Length", "Shannon_Entropy", "Uppercase_Ratio", "Digit_Ratio",
+    "Punct_SingleQuote", "Punct_DoubleQuote", "Punct_Backtick", "Punct_Semicolon", 
+    "Punct_Comma", "Punct_OpenParen", "Punct_CloseParen", "Punct_OpenBracket", 
+    "Punct_CloseBracket", "Punct_OpenBrace", "Punct_CloseBrace", "Punct_Backslash", 
+    "Punct_Slash", "Punct_Question", "Op_SQLComment", "Op_Hash", "Op_SlashStar", 
+    "Op_StarSlash", "Op_LessThan", "Op_GreaterThan", "Op_Equals", "Op_Exclamation", 
+    "Op_Pipe", "Op_Ampersand", "Flag_HttpHttps", "Flag_IPv4", "Flag_IPv6", 
+    "Flag_HexIP", "Flag_HexPct", "Flag_HTMLTag", "Flag_SQLTautology", "Flag_UnionSelect", 
+    "Flag_DoubleSpace", "Flag_NewLine", "Flag_NullByte", "Flag_Base64", "Flag_CharFunc", 
+    "Flag_FromCharCode"
+]
+
+try:
+    from stix2 import Indicator, AttackPattern, Relationship, Bundle, Identity
+except ImportError:
+    print("[*] Installing missing enterprise dependency: stix2...")
+    os.system("pip install stix2")
+    from stix2 import Indicator, AttackPattern, Relationship, Bundle, Identity
+
+# =====================================================================
+# ENGINE PHASE 1: STRUCTURAL VECTOR MATHEMATICS ENGINE
+# =====================================================================
+class StructuralWAFParser:
+    def __init__(self):
+        self.ipv4 = re.compile(r'(?:\d{1,3}\.){3}\d{1,3}')
+        self.ipv6 = re.compile(r'(([0-9a-fA-F]{1,4}:){7,7}[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,7}:|([0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4})')
+        self.hex_ip = re.compile(r'0x[0-9a-fA-F]{2,8}')
+        self.hex_pct = re.compile(r'%[0-9a-fA-F]{2}')
+        self.html_tag = re.compile(r'</?[a-zA-Z][^>]*>')
+        self.sql_tautology = re.compile(r'(\w+)\s*=\s*\1|(\d+)\s*=\s*\2')
+        self.union_select = re.compile(r'union\s+(?:all\s+)?select')
+
+    def _shannon_entropy(self, s):
+        if not s: return 0.0
+        return float(-sum((count / len(s)) * math.log(count / len(s), 2) for count in [s.count(c) for c in set(s)]))
+
+    def extract_features(self, text_array):
+        matrix = []
+        for text in text_array:
+            s = str(text)
+            low = s.lower()
+            L = len(s) if len(s) > 0 else 1
+
+            f_stat = [float(len(s)), self._shannon_entropy(s), sum(1 for c in s if c.isupper()) / L, sum(1 for c in s if c.isdigit()) / L]
+            chars_to_track = ["'", '"', '`', ';', ',', '(', ')', '[', ']', '{', '}', '\\', '/', '?']
+            f_punct = [s.count(c) / L for c in chars_to_track]
+            special_tokens = ['--', '#', '/*', '*/', '<', '>', '=', '!', '|', '&']
+            f_special = [s.count(tok) / L for tok in special_tokens]
+
+            f_evasion = [
+                float(low.count('http://') + low.count('https://')) / L,
+                1.0 if self.ipv4.search(s) else 0.0,
+                1.0 if self.ipv6.search(s) else 0.0,
+                1.0 if self.hex_ip.search(low) else 0.0,
+                float(len(self.hex_pct.findall(s))) / L,
+                1.0 if self.html_tag.search(s) else 0.0,
+                1.0 if self.sql_tautology.search(low) else 0.0,
+                1.0 if self.union_select.search(low) else 0.0,
+                float(s.count('  ')) / L,
+                1.0 if ('\n' in s or '\r' in s) else 0.0,
+                float(s.count('%00') + s.count('\\0')) / L,
+                1.0 if 'base64' in low else 0.0,
+                1.0 if 'char(' in low else 0.0,
+                1.0 if 'string.fromcharcode' in low else 0.0
+            ]
+            matrix.append(f_stat + f_punct + f_special + f_evasion)
+        return np.array(matrix, dtype=np.float32)
+
+# =====================================================================
+# ENGINE PHASE 2: THREAT INTELLIGENCE ORCHESTRATOR
+# =====================================================================
+class ThreatIntelOrchestrator:
+    def __init__(self):
+        self.identity = Identity(name="Corporate-Hybrid-WAF-Cluster", identity_class="organization")
+        self.mitre_matrix = {
+            "SQLi": {"id": "T1190", "name": "Exploit Public-Facing Application: SQL Injection", "desc": "SQL structure modification attempt."},
+            "XSS": {"id": "T1190.002", "name": "Exploit Public-Facing Application: DOM-Based XSS", "desc": "Client-side browser script execution exploit."},
+            "SSRF": {"id": "T1190", "name": "Exploit Public-Facing Application: Server-Side Request Forgery", "desc": "Inbound payload targeted local host interfaces."}
+        }
+
+    def serialize_threat_report(self, payload_string, threat_type, confidence_score):
+        if threat_type not in self.mitre_matrix: return None
+        m_data = self.mitre_matrix[threat_type]
+        safe_str = payload_string.replace("'", "\\'")
+        
+        indicator = Indicator(
+            name=f"WAF-Detected-{threat_type}-Signature",
+            description=f"Automated vector pattern matched threat classification with {confidence_score:.2f}% certainty.",
+            pattern=f"[network-traffic:extension.'http-request-ext'.body MATCHES '{safe_str}']", pattern_type="stix"
+        )
+        attack_pattern = AttackPattern(
+            name=m_data["name"], description=m_data["desc"],
+            external_references=[{"source_name": "mitre-attack", "external_id": m_data["id"], "url": f"https://attack.mitre.org/techniques/{m_data['id'].replace('.', '/')}/"}]
+        )
+        relationship = Relationship(relationship_type="indicates", source_ref=indicator.id, target_ref=attack_pattern.id)
+        bundle = Bundle(objects=[self.identity, indicator, attack_pattern, relationship])
+        
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"stix_threat_report_{threat_type}_{timestamp}.json"
+        with open(filename, "w") as f:
+            f.write(bundle.serialize(pretty=True))
+        return filename
+
+# =====================================================================
+# ENGINE PHASE 3: COMPOSITE MASTER GATEWAY RUNTIME
+# =====================================================================
+class ProductionWAFGateway:
+    def __init__(self, use_finetuned=False, enable_shap=False):
+        print("\n=== Initializing WAF Production Engine Pipeline ===")
+        self.enable_shap = enable_shap
+        self.parser = StructuralWAFParser()
+        self.orchestrator = ThreatIntelOrchestrator()
+        
+        target_model = FINE_TUNED_MODEL_PATH if use_finetuned and os.path.exists(FINE_TUNED_MODEL_PATH) else MODEL_PATH
+        if not os.path.exists(target_model) or not os.path.exists(TOKENIZER_PATH):
+            print("[!] Model core binaries missing. Pipeline cannot run inference without training first.")
+            return
+
+        self.model = tf.keras.models.load_model(target_model)
+        with open(TOKENIZER_PATH, 'rb') as f:
+            self.tokenizer = pickle.load(f)
+        print(f"[+] Operational Security Core Injected: Using '{target_model}'")
+
+    def _canonicalize_payload(self, payload_string):
+        """ Recursively unpacks obfuscated payload masking to restore clear-text syntax profiles """
+        current = str(payload_string)
+        max_depth = 3
+        
+        for _ in range(max_depth):
+            previous = current
+            current = urllib.parse.unquote(current)
+            current = html.unescape(current)
+            current = re.sub(r'(?:\\x|0x)([0-9a-fA-F]{2})', lambda m: chr(int(m.group(1), 16)), current)
+            
+            # Identify and translate standalone Base64 strings matching typical attack block formats
+            b64_matches = re.findall(r'\b[A-Za-z0-9+/]{4,}={0,2}\b', current)
+            for match in b64_matches:
+                try:
+                    decoded_b64 = base64.b64decode(match).decode('utf-8', errors='ignore')
+                    if any(tag in decoded_b64.lower() for tag in ['<', '>', 'script', 'select', 'union']):
+                        current = current.replace(match, decoded_b64)
+                except Exception:
+                    continue
+                    
+            if current == previous:
+                break
+        return current
+
+    def _is_dangerous_ssrf_host(self, url_string):
+        """ Decoupled socket address evaluation wrapper targeting integer, hex, octal, and loopback ranges """
+        try:
+            # Append protocol structure if dealing with raw IP sequences to ensure successful extraction
+            if not url_string.lower().startswith(('http://', 'https://')):
+                parsed_url = urllib.parse.urlparse('http://' + url_string)
+            else:
+                parsed_url = urllib.parse.urlparse(url_string)
+                
+            hostname = parsed_url.hostname
+            if not hostname:
+                # Strip out query markers if parsing complex inline targets directly
+                hostname = url_string.split('/')[0].split('?')[0].split(':')[0]
+            
+            # Resolve structural string values against system DNS architecture to catch translation tricks
+            resolved_ip_str = socket.gethostbyname(hostname)
+            ip_obj = ipaddress.ip_address(resolved_ip_str)
+            
+            if ip_obj.is_private or ip_obj.is_loopback or ip_obj.is_link_local:
+                return True
+            return False
+        except Exception:
+            return False
+
+    def inspect_traffic(self, payload_string):
+        if not hasattr(self, 'model'): return "UNCONFIGURED"
+        
+        # Ingest raw format sequences directly into the deep learning input nodes
+        feat = self.parser.extract_features([payload_string])
+        seq = pad_sequences(self.tokenizer.texts_to_sequences([payload_string]), maxlen=MAX_CHARS, padding='post')
+        
+        pred_probs = self.model.predict([seq, feat], verbose=0)[0]
+        predicted_idx = np.argmax(pred_probs)
+        ai_pred = TARGET_NAMES[predicted_idx]
+        ai_conf = pred_probs[predicted_idx] * 100
+        
+        final_verdict = ai_pred
+        override_triggered = False
+
+        # Generate canonical strings to expose hidden markers to circuit breakers
+        normalized = self._canonicalize_payload(payload_string)
+
+        # --- DUAL-SIDED VALIDATION RING CORE ---
+        
+        # Branch 1: Mitigate False Positives (AI alerts Malicious, but execution tokens are missing)
+        if ai_pred == 'SQLi' and not REAL_SQLI_SYNTAX.search(normalized):
+            final_verdict = 'Benign'; override_triggered = True
+        elif ai_pred == 'SSRF' and not (REAL_SSRF_SYNTAX.search(normalized) or self._is_dangerous_ssrf_host(normalized)):
+            final_verdict = 'Benign'; override_triggered = True
+        elif ai_pred == 'XSS' and not REAL_XSS_SYNTAX.search(normalized):
+            final_verdict = 'Benign'; override_triggered = True
+
+        # Branch 2: Mitigate False Negatives (AI claims Benign, but explicit markers match)
+        elif ai_pred == 'Benign':
+            has_sqli_keyword = any(
+              re.search(rf"\b{word}\b", normalized.lower()) 
+              for word in ['select', 'union', 'where', 'or', 'and']
+            ) or any(x in normalized.lower() for x in ['0x', '/*', '*/'])
+
+            if REAL_SQLI_SYNTAX.search(normalized) and has_sqli_keyword:
+                final_verdict = 'SQLi'; override_triggered = True; predicted_idx = 2; ai_conf = 100.0
+            elif self._is_dangerous_ssrf_host(normalized) or (REAL_SSRF_SYNTAX.search(normalized) and any(x in normalized.lower() for x in ['http', 'metadata', 'aws', 'internal', 'compute', '@', 'v1'])):
+                final_verdict = 'SSRF'; override_triggered = True; predicted_idx = 3; ai_conf = 100.0
+            elif REAL_XSS_SYNTAX.search(normalized) and any(x in normalized.lower() for x in ['<', '>', 'script', 'onload', 'onerror', 'charcode']):
+                final_verdict = 'XSS'; override_triggered = True; predicted_idx = 1; ai_conf = 100.0
+
+        print(f"\nPayload Evaluated: \"{payload_string}\"")
+        if override_triggered:
+            print(f" ├─ ML Prediction Model Alert: {ai_pred} ({pred_probs[np.argmax(pred_probs)]*100:.2f}%)")
+            print(f" ├─ [CIRCUIT BREAKER OVERRIDE]: Conflicting structural parameters. Re-routing payload...")
+            
+            with open(AUDIT_LOG_PATH, "a") as f:
+                f.write(f"{datetime.now().isoformat()}|||{predicted_idx}|||{ai_conf:.2f}|||{payload_string}\n")
+
+        print(f" └─ RUNTIME ROUTING DECISION: ──> **{final_verdict}** (Final Status Confirmation)")
+        
+        if final_verdict != 'Benign':
+            print(f"    [!] Threat Confirmed. Auto-generating cryptographic STIX report...")
+            report_file = self.orchestrator.serialize_threat_report(payload_string, final_verdict, ai_conf)
+            print(f"    [+] Forensic asset written to workspace disk as: '{report_file}'")
+
+        # =====================================================================
+        # DECOUPLED DYNAMIC SHAP ENGINE
+        # =====================================================================
+        if self.enable_shap:
+            print("\n    🔬 [INLINE SHAP DEEP ANALYSIS FOR CURRENT PAYLOAD]:")
+            
+            def shap_predict_dynamic(feat_mat):
+                batch_size = feat_mat.shape[0]
+                repeated_seqs = np.repeat(seq, batch_size, axis=0)
+                return self.model.predict([repeated_seqs, feat_mat], verbose=0)
+            
+            explainer = shap.KernelExplainer(shap_predict_dynamic, np.zeros((1, 42), dtype=np.float32))
+            shap_val = explainer.shap_values(feat, silent=True)
+            
+            if isinstance(shap_val, list):
+                class_shap = shap_val[predicted_idx][0]
+            else:
+                if len(shap_val.shape) == 3:
+                    class_shap = shap_val[0, :, predicted_idx]
+                else:
+                    class_shap = shap_val[0]
+
+            top_i = np.argsort(np.abs(class_shap))[::-1][:3]
+            for rank, i in enumerate(top_i):
+                print(f"      └─ Top {rank+1}: {FEATURE_NAMES[i]} (Impact Magnitude: {class_shap[i]:.4f})")
+
+# =====================================================================
+# SYSTEM COMPONENT A: BALANCED BASELINE LAYER TRAINING FROM ZERO
+# =====================================================================
+def run_clean_baseline_training():
+    print("\n============================================================\n"
+          "         PHASE A: EXECUTING COMPLETE BASELINE MODEL TRAINING\n"
+          "============================================================")
+    if not os.path.exists(RAW_DATASET_PATH):
+        print(f"[!] Target matrix file '{RAW_DATASET_PATH}' missing. Cannot execute baseline training.")
+        return
+
+    df = pd.read_csv(RAW_DATASET_PATH).drop_duplicates(subset=['text']).copy()
+    min_size = df['label'].value_counts().min()
+    balanced = pd.concat([df[df['label'] == l].sample(n=min_size, random_state=42) for l in sorted(df['label'].unique())])
+    df_bal = balanced.sample(frac=1, random_state=42).reset_index(drop=True)
+    
+    parser = StructuralWAFParser()
+    X_feats = parser.extract_features(df_bal['text'].values)
+    
+    tokenizer = Tokenizer(char_level=True, lower=True, oov_token="<OOV>", filters="")
+    tokenizer.fit_on_texts(df_bal['text'].values)
+    with open(TOKENIZER_PATH, 'wb') as f: pickle.dump(tokenizer, f)
+    X_seqs = pad_sequences(tokenizer.texts_to_sequences(df_bal['text'].values), maxlen=MAX_CHARS, padding='post')
+    
+    X_train_seq, X_test_seq, X_train_feat, X_test_feat, y_train, y_test = train_test_split(
+        X_seqs, X_feats, df_bal['label'].values, test_size=0.2, stratify=df_bal['label'].values, random_state=42
+    )
+
+    # --- BALANCED ARCHITECTURE GRAPH RE-WEIGHTING ---
+    seq_in = Input(shape=(MAX_CHARS,), name="Sequence_Text_Input")
+    embed = Embedding(input_dim=len(tokenizer.word_index)+1, output_dim=64, name="Char_Embedding")(seq_in)
+    
+    # Expanded sequence tracking matrix width to boost context awareness (64 -> 128 units)
+    lstm = Bidirectional(LSTM(128, return_sequences=False), name="Bi_LSTM_Processor")(embed)
+    lstm = Dropout(0.4)(lstm)
+
+    # Scaled down dense node processing limits to reduce tabular layout dominance (64 -> 32 nodes)
+    feat_in = Input(shape=(42,), name="Engineered_Structural_Features_Input")
+    dense_f = Dense(32, activation='relu', name="Dense_Feature_L1")(feat_in)
+    dense_f = BatchNormalization()(dense_f)
+    dense_f = Dropout(0.3)(dense_f)
+    dense_f = Dense(16, activation='relu', name="Dense_Feature_L2")(dense_f)
+
+    merged = Concatenate(name="Feature_Sequence_Fusion")([lstm, dense_f])
+    core = Dense(64, activation='relu', name="Unified_Hidden_Layer")(merged)
+    core = Dropout(0.3)(core)
+    out = Dense(4, activation='softmax', name="WAF_Classification_Output")(core)
+
+    model = Model(inputs=[seq_in, feat_in], outputs=out)
+    model.compile(optimizer='adam', loss='sparse_categorical_crossentropy', metrics=['accuracy'])
+    
+    model.fit([X_train_seq, X_train_feat], y_train, validation_data=([X_test_seq, X_test_feat], y_test), 
+              epochs=15, batch_size=64, callbacks=[tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=3, restore_best_weights=True)])
+    model.save(MODEL_PATH)
+    print(f"[+] Core structural network saved to: '{MODEL_PATH}'")
+
+# =====================================================================
+# SYSTEM COMPONENT B: LAYER-FROZEN SOFT FINE-TUNING PIPELINE
+# =====================================================================
+def run_soft_finetuning_pipeline():
+    print("\n============================================================\n"
+          "         PHASE B: INGESTING HUMAN LOGS AND SOFT FINE-TUNING\n"
+          "============================================================")
+    if not os.path.exists(MODEL_PATH) or not os.path.exists(TOKENIZER_PATH):
+        print("[!] Pre-trained configuration assets missing. Run baseline training first.")
+        return
+
+    if not os.path.exists(CORRECTED_DATA_PATH):
+        pd.DataFrame({
+            "text": ["SELECT the perfect gift for your family this Christmas!", "Go to localhost on infrastructure page.", "SELECT * FROM users WHERE id = 1 OR 1=1; --"],
+            "label": [0, 0, 2]
+        }).to_csv(CORRECTED_DATA_PATH, index=False)
+
+    df_corr = pd.read_csv(CORRECTED_DATA_PATH)
+    model = tf.keras.models.load_model(MODEL_PATH)
+    with open(TOKENIZER_PATH, 'rb') as f: tokenizer = pickle.load(f)
+    parser = StructuralWAFParser()
+
+    X_feats = parser.extract_features(df_corr['text'].values)
+    X_seqs = pad_sequences(tokenizer.texts_to_sequences(df_corr['text'].values), maxlen=MAX_CHARS, padding='post')
+
+    print("[*] Freezing Early Sequence and Feature Graph layers...")
+    for layer in model.layers:
+        if any(name in layer.name for name in ["Char_Embedding", "Bi_LSTM", "Dense_Feature_L1"]):
+            layer.trainable = False
+        else:
+            layer.trainable = True
+
+    model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=0.0001), loss='sparse_categorical_crossentropy', metrics=['accuracy'])
+    history = model.fit([X_seqs, X_feats], df_corr['label'].values, epochs=5, batch_size=2, verbose=1)
+    model.save(FINE_TUNED_MODEL_PATH)
+    print(f"[+] Fine-tuned model variant saved to: '{FINE_TUNED_MODEL_PATH}'")
+    
+    report_filename = f"waf_finetuning_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md"
+    with open(report_filename, "w") as r:
+        r.write(f"# WAF Fine-Tuning Performance Audit Report\n**Timestamp:** {datetime.now().isoformat()}\n\n"
+                f"* Final Step Training Loss: {history.history['loss'][-1]:.6f}\n"
+                f"* Final Step Training Accuracy: {history.history['accuracy'][-1]*100:.2f}%\n"
+                f"Ingested {len(df_corr)} analyst-corrected edge entries securely.\n")
+    print(f"[+] Operational audit saved to workspace: '{report_filename}'")
+
+# =====================================================================
+# SYSTEM COMPONENT C: OFFLINE BACKGROUND FORENSICS ENGINE (SHAP LOGS)
+# =====================================================================
+def run_offline_forensics():
+    print("\n============================================================\n"
+          "         PHASE C: OFFLINE BACKGROUND LOG EXPLAINER LOOPS\n"
+          "============================================================")
+    if not os.path.exists(AUDIT_LOG_PATH) or os.stat(AUDIT_LOG_PATH).st_size == 0:
+        print("[*] Audit triage log file queue is completely empty. No diagnostics needed.")
+        return
+
+    model = tf.keras.models.load_model(MODEL_PATH)
+    with open(TOKENIZER_PATH, 'rb') as f: tokenizer = pickle.load(f)
+    parser = StructuralWAFParser()
+
+    with open(AUDIT_LOG_PATH, "r") as f: lines = f.readlines()
+    
+    report_file = "offline_forensic_report.txt"
+    with open(report_file, "w") as r:
+        r.write("=== BACKLOG FALSE POSITIVE ROOT-CAUSE AUDIT SUMMARY ===\n\n")
+        for line in lines:
+            if not line.strip(): continue
+            ts, cls_idx, conf, payload = line.strip().split("|||", 3)
+            cls_idx = int(cls_idx)
+            feat = parser.extract_features([payload])
+            seq_curr = pad_sequences(tokenizer.texts_to_sequences([payload]), maxlen=MAX_CHARS, padding='post')
+            
+            def shap_predict_bg(feat_mat):
+                batch_size = feat_mat.shape[0]
+                repeated_seqs = np.repeat(seq_curr, batch_size, axis=0)
+                return model.predict([repeated_seqs, feat_mat], verbose=0)
+                
+            explainer = shap.KernelExplainer(shap_predict_bg, np.zeros((1, 42), dtype=np.float32))
+            shap_val = explainer.shap_values(feat, silent=True)
+            
+            if isinstance(shap_val, list):
+                class_shap = shap_val[cls_idx][0]
+            else:
+                if len(shap_val.shape) == 3:
+                    class_shap = shap_val[0, :, cls_idx]
+                else:
+                    class_shap = shap_val[0]
+            
+            top_i = np.argsort(np.abs(class_shap))[::-1][:3]
+            
+            out_block = (f"Record: [{ts}] | Original Flag: {TARGET_NAMES[cls_idx]} ({conf}%)\n"
+                         f" ├─ Source Request String: \"{payload}\"\n"
+                         f" └─ Top SHAP Root-Cause Structural Explanations:\n"
+                         f"     ├─ 1. {FEATURE_NAMES[top_i[0]]} ({class_shap[top_i[0]]:.4f})\n"
+                         f"     ├─ 2. {FEATURE_NAMES[top_i[1]]} ({class_shap[top_i[1]]:.4f})\n"
+                         f"     └─ 3. {FEATURE_NAMES[top_i[2]]} ({class_shap[top_i[2]]:.4f})\n"
+                         f"{'-'*75}\n")
+            print(out_block)
+            r.write(out_block)
+            
+    open(AUDIT_LOG_PATH, 'w').close() 
+    print(f"[+] Forensic review complete. Persistent audit saved to: '{report_file}'")
+
+# =====================================================================
+# SYSTEM GATEWAY MASTER EXECUTION CONTROLLER (INTERACTIVE MODE)
+# =====================================================================
+if __name__ == "__main__":
+    # Launch pipeline. Set enable_shap=True/False depending on performance requirements.
+    gateway = ProductionWAFGateway(use_finetuned=False, enable_shap=True)
+    
+    print("\n🚀 INTERACTIVE HYBRID WAF GATEWAY ONLINE")
+    print("Type your custom request string payload below to test the pipeline (or type 'exit' to quit).")
+    print("=" * 80)
+    
+    while True:
+        try:
+            user_payload = input("\nEnter Request Payload > ")
+            if user_payload.strip().lower() == 'exit':
+                print("[*] Terminating WAF core interface workspace. System safe.")
+                break
+            if not user_payload.strip():
+                continue
+            gateway.inspect_traffic(user_payload)
+        except KeyboardInterrupt:
+            print("\n[*] Script interrupted by user. Exiting context safely.")
+            break
