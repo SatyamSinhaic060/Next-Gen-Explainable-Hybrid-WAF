@@ -1,0 +1,12 @@
+# Delete the old environment if it's broken
+rm -rf waf_env
+
+# Create a fresh, pristine virtual environment
+python3 -m venv waf_env
+
+# ACTIVATE IT FIRST (Crucial step!)
+source waf_env/bin/activate
+
+# Install the dependencies cleanly into the folder
+pip install --upgrade pip
+pip install tensorflow numpy pandas scikit-learn shap stix2
