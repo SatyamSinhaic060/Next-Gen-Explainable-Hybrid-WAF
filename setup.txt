@@ -1,5 +1,5 @@
-# Delete the old environment if it's broken
-rm -rf waf_env
+# Make a directory and move the model and tokenizer in that directory 
+mkdir hybrid-Waf
 
 # Create a fresh, pristine virtual environment
 python3 -m venv waf_env
